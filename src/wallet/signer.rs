@@ -84,17 +84,21 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Bound::Included, Deref};
+use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bitcoin::blockdata::opcodes;
 use bitcoin::blockdata::script::Builder as ScriptBuilder;
 use bitcoin::hashes::{hash160, Hash};
+use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::Message;
 use bitcoin::util::bip32::{ChildNumber, DerivationPath, ExtendedPrivKey, Fingerprint};
 use bitcoin::util::{ecdsa, psbt, schnorr, sighash, taproot};
 use bitcoin::{secp256k1, XOnlyPublicKey};
 use bitcoin::{EcdsaSighashType, PrivateKey, PublicKey, SchnorrSighashType, Script};
 
+use log::warn;
 use miniscript::descriptor::{
     Descriptor, DescriptorPublicKey, DescriptorSecretKey, DescriptorXKey, KeyMap, SinglePriv,
     SinglePubKey,
@@ -320,6 +324,7 @@ impl InputSigner for SignerWrapper<DescriptorXKey<ExtendedPrivKey>> {
         sign_options: &SignOptions,
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
+        dbg!("SignerWrapper<DescriptorXKey<ExtendedPrivKey>>::sign_input");
         if input_index >= psbt.inputs.len() {
             return Err(SignerError::InputIndexOutOfRange);
         }
@@ -330,12 +335,11 @@ impl InputSigner for SignerWrapper<DescriptorXKey<ExtendedPrivKey>> {
             return Ok(());
         }
 
-        let tap_key_origins = psbt.inputs[input_index]
-            .tap_key_origins
+        dbg!(psbt.inputs.len());
+        let tap_key_origins = dbg!(&psbt.inputs[input_index].tap_key_origins)
             .iter()
             .map(|(pk, (_, keysource))| (SinglePubKey::XOnly(*pk), keysource));
-        let (public_key, full_path) = match psbt.inputs[input_index]
-            .bip32_derivation
+        let (public_key, full_path) = match dbg!(&psbt.inputs[input_index].bip32_derivation)
             .iter()
             .map(|(pk, keysource)| (SinglePubKey::FullKey(PublicKey::new(*pk)), keysource))
             .chain(tap_key_origins)
@@ -349,6 +353,7 @@ impl InputSigner for SignerWrapper<DescriptorXKey<ExtendedPrivKey>> {
             Some((pk, full_path)) => (pk, full_path),
             None => return Ok(()),
         };
+        dbg!(&public_key, &full_path);
 
         let derived_key = match self.origin.clone() {
             Some((_fingerprint, origin_path)) => {
@@ -403,6 +408,7 @@ impl InputSigner for SignerWrapper<PrivateKey> {
         sign_options: &SignOptions,
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
+        dbg!("SignerWrapper<PrivateKey>::sign_input");
         if input_index >= psbt.inputs.len() || input_index >= psbt.unsigned_tx.input.len() {
             return Err(SignerError::InputIndexOutOfRange);
         }
@@ -494,6 +500,220 @@ impl InputSigner for SignerWrapper<PrivateKey> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AwsKmsKey {}
+
+const EXECUTABLE_PATH: &str = "/home/domi/bitcoin-transfer/target/release/kms_sign";
+const KEY_ARN: &str = "arn:aws:kms:us-east-2:571922870935:key/17be5d9e-d752-4350-bbc1-68993fa25a4f";
+
+impl AwsKmsKey {
+    fn get_pubkey(&self) -> PublicKey {
+        let process = Command::new(EXECUTABLE_PATH)
+            .arg("get_pubkey")
+            .env("KEY_ARN", KEY_ARN)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        let stdout = std::str::from_utf8(&output.stdout).unwrap().trim();
+        let pk = PublicKey::from_str(stdout).unwrap();
+        // FIXME: hardcoded
+        let pk_expected = PublicKey::from_str("04002c5c77d7951eaa1818a7b409181b2e4a81e93e6eb44c6fe92c637c492725bb9cf195906695937f974446cd6b602c7164158928e5bd43e808a06d831d35a1d8").unwrap();
+        assert_eq!(pk, pk_expected);
+        pk
+    }
+
+    fn sign_ecdsa(&self, msg: &Message) -> secp256k1::ffi::Signature {
+        todo!()
+    }
+
+    fn sign_ecdsa_low_r(&self, msg: &Message) -> secp256k1::ecdsa::Signature {
+        // FIXME
+        // todo!("sign_ecdsa_low_r");
+
+        let m = msg.as_ref();
+
+        use base64::prelude::*;
+        fn encode_base64(input: &[u8]) -> String {
+            BASE64_STANDARD.encode(input)
+        }
+        let m = encode_base64(m);
+
+        let process = Command::new(EXECUTABLE_PATH)
+            .arg("sign")
+            .arg(m)
+            .env("KEY_ARN", KEY_ARN)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        let stdout = std::str::from_utf8(&output.stdout).unwrap().trim();
+        let sign = Signature::from_str(stdout);
+        sign.unwrap()
+    }
+}
+
+impl SignerCommon for SignerWrapper<AwsKmsKey> {
+    fn id(&self, secp: &SecpCtx) -> SignerId {
+        SignerId::from(self.get_pubkey().to_pubkeyhash(SigType::Ecdsa))
+    }
+
+    fn descriptor_secret_key(&self) -> Option<DescriptorSecretKey> {
+        todo!()
+        // Some(DescriptorSecretKey::Single(SinglePriv {
+        //     key: self.signer,
+        //     origin: None,
+        // }))
+    }
+}
+
+impl InputSigner for SignerWrapper<AwsKmsKey> {
+    fn sign_input(
+        &self,
+        psbt: &mut psbt::PartiallySignedTransaction,
+        input_index: usize,
+        sign_options: &SignOptions,
+        secp: &SecpCtx,
+    ) -> Result<(), SignerError> {
+        dbg!("SignerWrapper<AwsKmsKey>::sign_input");
+        if input_index >= psbt.inputs.len() || input_index >= psbt.unsigned_tx.input.len() {
+            return Err(SignerError::InputIndexOutOfRange);
+        }
+
+        if psbt.inputs[input_index].final_script_sig.is_some()
+            || psbt.inputs[input_index].final_script_witness.is_some()
+        {
+            return Ok(());
+        }
+
+        let pubkey = self.get_pubkey();
+        let x_only_pubkey = XOnlyPublicKey::from(pubkey.inner);
+
+        if let SignerContext::Tap { is_internal_key } = self.ctx {
+            if is_internal_key
+                && psbt.inputs[input_index].tap_key_sig.is_none()
+                && sign_options.sign_with_tap_internal_key
+            {
+                let (hash, hash_ty) = Tap::sighash(psbt, input_index, None)?;
+                todo!();
+                // sign_psbt_schnorr(
+                //     &self.inner,
+                //     x_only_pubkey,
+                //     None,
+                //     &mut psbt.inputs[input_index],
+                //     hash,
+                //     hash_ty,
+                //     secp,
+                // );
+            }
+
+            if let Some((leaf_hashes, _)) =
+                psbt.inputs[input_index].tap_key_origins.get(&x_only_pubkey)
+            {
+                let leaf_hashes = leaf_hashes
+                    .iter()
+                    .filter(|lh| {
+                        // Removing the leaves we shouldn't sign for
+                        let should_sign = match &sign_options.tap_leaves_options {
+                            TapLeavesOptions::All => true,
+                            TapLeavesOptions::Include(v) => v.contains(lh),
+                            TapLeavesOptions::Exclude(v) => !v.contains(lh),
+                            TapLeavesOptions::None => false,
+                        };
+                        // Filtering out the leaves without our key
+                        should_sign
+                            && !psbt.inputs[input_index]
+                                .tap_script_sigs
+                                .contains_key(&(x_only_pubkey, **lh))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for lh in leaf_hashes {
+                    let (hash, hash_ty) = Tap::sighash(psbt, input_index, Some(lh))?;
+                    todo!();
+                    // sign_psbt_schnorr(
+                    //     &self.inner,
+                    //     x_only_pubkey,
+                    //     Some(lh),
+                    //     &mut psbt.inputs[input_index],
+                    //     hash,
+                    //     hash_ty,
+                    //     secp,
+                    // );
+                }
+            }
+
+            return Ok(());
+        }
+
+        if psbt.inputs[input_index].partial_sigs.contains_key(&pubkey) {
+            return Ok(());
+        }
+
+        let (hash, hash_ty) = match self.ctx {
+            SignerContext::Segwitv0 => Segwitv0::sighash(psbt, input_index, ())?,
+            SignerContext::Legacy => Legacy::sighash(psbt, input_index, ())?,
+            _ => return Ok(()), // handled above
+        };
+        sign_psbt_ecdsa_aws(
+            &self,
+            // &self.inner,
+            pubkey,
+            &mut psbt.inputs[input_index],
+            hash,
+            hash_ty,
+            secp,
+            sign_options.allow_grinding,
+        );
+
+        Ok(())
+    }
+}
+
+fn sign_psbt_ecdsa_aws(
+    aws_kms_key: &AwsKmsKey,
+    // secret_key: &secp256k1::SecretKey,
+    pubkey: PublicKey,
+    psbt_input: &mut psbt::Input,
+    hash: bitcoin::Sighash,
+    hash_ty: EcdsaSighashType,
+    secp: &SecpCtx,
+    allow_grinding: bool,
+) {
+    dbg!("sign_psbt_ecdsa_aws");
+
+    let msg = &Message::from_slice(&hash.into_inner()[..]).unwrap();
+    dbg!(pubkey.to_string());
+
+    let mut attempts = 5;
+    let sig = loop {
+        let sig = if allow_grinding {
+            secp.sign_ecdsa_low_r_external(msg, |msg| aws_kms_key.sign_ecdsa_low_r(msg))
+        } else {
+            // aws_kms_key.sign_ecdsa(msg)
+            todo!()
+        };
+        match secp.verify_ecdsa(msg, &sig, &pubkey.inner) {
+            Ok(()) => break sig,
+            Err(err) => {
+                if attempts > 0 {
+                    attempts -= 1;
+                    warn!("AWS signing attempts left {attempts}");
+                    continue;
+                } else {
+                    panic!("invalid or corrupted ecdsa signature; {:?}", err);
+                }
+            }
+        }
+    };
+    dbg!(sig);
+
+    let final_signature = ecdsa::EcdsaSig { sig, hash_ty };
+    psbt_input.partial_sigs.insert(pubkey, final_signature);
+}
+
 fn sign_psbt_ecdsa(
     secret_key: &secp256k1::SecretKey,
     pubkey: PublicKey,
@@ -503,6 +723,8 @@ fn sign_psbt_ecdsa(
     secp: &SecpCtx,
     allow_grinding: bool,
 ) {
+    dbg!("sign_psbt_ecdsa");
+
     let msg = &Message::from_slice(&hash.into_inner()[..]).unwrap();
     let sig = if allow_grinding {
         secp.sign_ecdsa_low_r(msg, secret_key)
@@ -526,6 +748,7 @@ fn sign_psbt_schnorr(
     hash_ty: SchnorrSighashType,
     secp: &SecpCtx,
 ) {
+    dbg!("sign_psbt_schnorr");
     use schnorr::TapTweak;
 
     let keypair = secp256k1::KeyPair::from_seckey_slice(secp, secret_key.as_ref()).unwrap();
