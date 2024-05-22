@@ -84,8 +84,6 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Bound::Included, Deref};
-use std::process::{Command, Stdio};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use bitcoin::blockdata::opcodes;
@@ -503,24 +501,11 @@ impl InputSigner for SignerWrapper<PrivateKey> {
 #[derive(Debug, Clone)]
 pub struct AwsKmsKey {}
 
-const EXECUTABLE_PATH: &str = "/home/domi/bitcoin-transfer/target/release/kms_sign";
-const KEY_ARN: &str = "arn:aws:kms:us-east-2:571922870935:key/17be5d9e-d752-4350-bbc1-68993fa25a4f";
-
 impl AwsKmsKey {
     fn get_pubkey(&self) -> PublicKey {
-        let process = Command::new(EXECUTABLE_PATH)
-            .arg("get_pubkey")
-            .env("KEY_ARN", KEY_ARN)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let output = process.wait_with_output().unwrap();
-        let stdout = std::str::from_utf8(&output.stdout).unwrap().trim();
-        let pk = PublicKey::from_str(stdout).unwrap();
-        // FIXME: hardcoded
-        let pk_expected = PublicKey::from_str("04002c5c77d7951eaa1818a7b409181b2e4a81e93e6eb44c6fe92c637c492725bb9cf195906695937f974446cd6b602c7164158928e5bd43e808a06d831d35a1d8").unwrap();
-        assert_eq!(pk, pk_expected);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pk_result = rt.block_on(async { kms_sign::get_pubkey().await });
+        let pk = PublicKey::from_slice(&pk_result.unwrap()).unwrap();
         pk
     }
 
@@ -529,29 +514,10 @@ impl AwsKmsKey {
     }
 
     fn sign_ecdsa_low_r(&self, msg: &Message) -> secp256k1::ecdsa::Signature {
-        // FIXME
-        // todo!("sign_ecdsa_low_r");
-
-        let m = msg.as_ref();
-
-        use base64::prelude::*;
-        fn encode_base64(input: &[u8]) -> String {
-            BASE64_STANDARD.encode(input)
-        }
-        let m = encode_base64(m);
-
-        let process = Command::new(EXECUTABLE_PATH)
-            .arg("sign")
-            .arg(m)
-            .env("KEY_ARN", KEY_ARN)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let output = process.wait_with_output().unwrap();
-        let stdout = std::str::from_utf8(&output.stdout).unwrap().trim();
-        let sign = Signature::from_str(stdout);
-        sign.unwrap()
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sig_result = rt.block_on(async { kms_sign::sign(msg.as_ref().to_vec()).await });
+        let sig = Signature::from_der(&sig_result.unwrap()).unwrap();
+        sig
     }
 }
 
@@ -577,7 +543,6 @@ impl InputSigner for SignerWrapper<AwsKmsKey> {
         sign_options: &SignOptions,
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
-        dbg!("SignerWrapper<AwsKmsKey>::sign_input");
         if input_index >= psbt.inputs.len() || input_index >= psbt.unsigned_tx.input.len() {
             return Err(SignerError::InputIndexOutOfRange);
         }
@@ -682,12 +647,9 @@ fn sign_psbt_ecdsa_aws(
     secp: &SecpCtx,
     allow_grinding: bool,
 ) {
-    dbg!("sign_psbt_ecdsa_aws");
-
     let msg = &Message::from_slice(&hash.into_inner()[..]).unwrap();
-    dbg!(pubkey.to_string());
 
-    let mut attempts = 5;
+    let mut attempts = 10;
     let sig = loop {
         let sig = if allow_grinding {
             secp.sign_ecdsa_low_r_external(msg, |msg| aws_kms_key.sign_ecdsa_low_r(msg))
@@ -708,8 +670,6 @@ fn sign_psbt_ecdsa_aws(
             }
         }
     };
-    dbg!(sig);
-
     let final_signature = ecdsa::EcdsaSig { sig, hash_ty };
     psbt_input.partial_sigs.insert(pubkey, final_signature);
 }

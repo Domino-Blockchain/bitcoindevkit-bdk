@@ -14,6 +14,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 base64 = "0.22.0"
 bdk-macros = "^0.6"
+hex = "0.4.3"
 kms_sign = { path = "../kms_sign" }
 log = "^0.4"
 miniscript = { path = "../rust-miniscript", version = "9.0", features = ["serde"] }
@@ -21,6 +22,7 @@ bitcoin = { path = "../rust-bitcoin", version = "0.29.2", features = ["serde", "
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.8"
+tokio = { version = "1" }
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }

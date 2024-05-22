@@ -1262,7 +1262,6 @@ where
             match desc {
                 Some(desc) => {
                     let mut tmp_input = bitcoin::TxIn::default();
-                    dbg!(&desc);
                     match desc.satisfy(
                         &mut tmp_input,
                         (
